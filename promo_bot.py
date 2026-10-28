@@ -24,7 +24,9 @@ import logging
 import os
 import re
 import secrets
+import signal
 import sqlite3
+import tempfile
 import time
 from datetime import datetime
 
@@ -91,7 +93,7 @@ log = logging.getLogger("promo")
 # ---------------- database ----------------
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.row_factory = sqlite3.Row
-_db.executescript("""
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
   user_id INTEGER PRIMARY KEY, first_name TEXT, username TEXT,
   ref_code TEXT UNIQUE, referred_by INTEGER, verified INTEGER DEFAULT 0, joined_at INTEGER);
@@ -103,7 +105,11 @@ CREATE TABLE IF NOT EXISTS clones(
 CREATE TABLE IF NOT EXISTS promo_joins(
   owner_id INTEGER, user_id INTEGER, ts INTEGER, UNIQUE(owner_id, user_id));
 CREATE TABLE IF NOT EXISTS seen(bot_id INTEGER, user_id INTEGER, UNIQUE(bot_id, user_id));
-""")
+CREATE TABLE IF NOT EXISTS bot_chats(
+  bot_id INTEGER, chat_id INTEGER, title TEXT, username TEXT, added_by INTEGER, ts INTEGER,
+  UNIQUE(bot_id, chat_id));
+"""
+_db.executescript(SCHEMA)
 _db.commit()
 
 
@@ -172,6 +178,26 @@ class Bot:
     async def send(self, chat_id, text, markup=None):
         return await self.api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
                               reply_markup=markup, link_preview_options={"is_disabled": True})
+
+
+async def _upload(self, method, fields, file_field, filename, data):
+    fd = aiohttp.FormData()
+    for k, v in fields.items():
+        fd.add_field(k, str(v))
+    fd.add_field(file_field, data, filename=filename)
+    try:
+        async with self.s.post(self.url + method, data=fd, timeout=aiohttp.ClientTimeout(total=120)) as r:
+            d = await r.json()
+    except Exception as e:
+        log.warning("%s upload failed: %s", method, e)
+        return None
+    if not d.get("ok"):
+        log.info("%s -> %s", method, d.get("description"))
+        return None
+    return d["result"]
+
+
+Bot.upload = _upload
 
 
 async def show(bot, msg, text, markup):
@@ -262,17 +288,18 @@ async def is_member(bot, chat, uid):
 
 
 async def process_gate(bot, uid, owner, u, final=False):
-    miss = []
+    """Returns (items, miss). items = ALL required channels with 'joined' flag."""
+    items = []
     for c in required(owner):
         if c["chat"] is None:          # private link without chat id -> cannot check
-            if not final:
-                miss.append(c)
-            continue
-        if not await is_member(bot, c["chat"], uid):
-            miss.append(c)
+            joined = final
+        else:
+            joined = await is_member(bot, c["chat"], uid)
+        items.append({**c, "joined": joined})
+    miss = [c for c in items if not c["joined"]]
     if miss:
         q("UPDATE users SET verified=0 WHERE user_id=?", (uid,))
-        return miss
+        return items, miss
     q("UPDATE users SET verified=1 WHERE user_id=?", (uid,))
     if owner and owner != uid:
         exists = q("SELECT 1 FROM promo_joins WHERE owner_id=? AND user_id=?", (owner, uid))
@@ -281,7 +308,7 @@ async def process_gate(bot, uid, owner, u, final=False):
             await bot.send(owner, f"{E['spark']} <b>New promo join!</b>\n"
                                   f"{E['user']} {esc(fullname(u))} ne tumhara link use karke sab channels join kiye.\n"
                                   f"{E['star']} Total joins: <b>{promo_count(owner)}</b>")
-    return miss
+    return items, miss
 
 
 # ---------------- texts & keyboards ----------------
@@ -324,8 +351,15 @@ def menu_markup(uid):
     return KB(*rows)
 
 
-def gate_markup(miss):
-    rows = [[B(f"{E['plus']} Join {c['title']}", url=c["url"], style=P)] for c in miss if c.get("url")]
+def gate_markup(items):
+    rows = []
+    for c in items:
+        if not c.get("url"):
+            continue
+        if c["joined"]:
+            rows.append([B(f"{E['ok']} {c['title']} - Joined", url=c["url"], style=G)])
+        else:
+            rows.append([B(f"{E['plus']} Join {c['title']}", url=c["url"], style=P)])
     rows.append([B(f"{E['ok']} Verify", "verify", style=G)])
     return KB(*rows)
 
@@ -346,16 +380,16 @@ MENU_TEXT = (f"{E['div_eq']}\n<blockquote><b>{E['diamond']} MAIN MENU</b></block
              f"{E['cog']} Neeche se option choose karo {E['arrow']}")
 
 
-async def send_card(bot, chat_id, u, miss):
+async def send_card(bot, chat_id, u, items, miss):
     bio = None
     chat = await bot.api("getChat", chat_id=u["id"])
     if chat:
         bio = chat.get("bio")
     text = profile_text(u, bio)
     if miss:
-        text += (f"\n\n{E['warn']} <b>Bot use karne ke liye ye channels join karo</b>, "
-                 f"phir <b>Verify</b> dabao.")
-        markup = gate_markup(miss)
+        text += (f"\n\n{E['warn']} <b>Bot use karne ke liye neeche ke {len(items)} channels join karo</b> "
+                 f"({len(miss)} baaki), phir <b>Verify</b> dabao.")
+        markup = gate_markup(items)
     else:
         markup = menu_markup(u["id"])
     photos = await bot.api("getUserProfilePhotos", user_id=u["id"], limit=1)
@@ -415,12 +449,15 @@ async def on_message(bot, m):
         owner = None
         if payload.startswith("p_"):
             r = q("SELECT user_id FROM users WHERE ref_code=?", (payload[2:],))
-            if r and r[0]["user_id"] != uid:
+            if r:
                 owner = r[0]["user_id"]
-                q("UPDATE users SET referred_by=? WHERE user_id=?", (owner, uid))
+                if owner != uid:
+                    q("UPDATE users SET referred_by=? WHERE user_id=?", (owner, uid))
+            else:
+                await bot.send(cid, f"{E['warn']} Ye promo link purana/invalid hai, isliye sirf main channels dikh rahe hain.")
         PENDING[uid] = owner
-        miss = await process_gate(bot, uid, owner, u)
-        await send_card(bot, cid, u, miss)
+        items, miss = await process_gate(bot, uid, owner, u)
+        await send_card(bot, cid, u, items, miss)
         return
 
     row = get_user(uid)
@@ -444,6 +481,8 @@ async def on_message(bot, m):
     mode = st["mode"]
     if mode == "add":
         await add_channel(bot, uid, cid, m)
+    elif mode == "invite":
+        await save_invite(bot, uid, cid, m, st)
     elif mode == "post":
         await do_post(bot, uid, cid, m, st)
     elif mode == "clone":
@@ -452,49 +491,118 @@ async def on_message(bot, m):
         await do_broadcast(bot, cid, m)
 
 
+def candidates(bot, uid):
+    """Channels where this user just made the bot admin (auto-detected) and not yet added."""
+    have = {r["chat_id"] for r in user_channels(uid)}
+    rows = q("SELECT * FROM bot_chats WHERE bot_id=? AND added_by=? ORDER BY ts DESC", (bot.id, uid))
+    return [r for r in rows if r["chat_id"] not in have]
+
+
+def add_kb(bot, uid):
+    rows = [[B(f"{E['plus']} Add: {c['title']}", f"ac:{c['chat_id']}", style=G)] for c in candidates(bot, uid)]
+    rows.append([B(f"{E['ok']} Done - Get Link", "add_done", style=G)])
+    rows.append(back_row("Cancel", "cancel"))
+    return KB(*rows)
+
+
+async def register_channel(bot, uid, ident):
+    chat = await bot.api("getChat", chat_id=ident)
+    if not chat or chat["type"] not in ("channel", "supergroup"):
+        return {"ok": False, "text": f"{E['no']} Channel nahi mila. Bot ko pehle channel me <b>admin</b> banao."}
+    me = await bot.api("getChatMember", chat_id=chat["id"], user_id=bot.id)
+    if not me or me["status"] != "administrator":
+        return {"ok": False, "text": f"{E['warn']} Bot is channel me admin nahi hai. Admin banao (invite-link permission ke sath) aur dobara try karo."}
+    um = await bot.api("getChatMember", chat_id=chat["id"], user_id=uid)
+    if not um or um["status"] not in ("creator", "administrator"):
+        return {"ok": False, "text": f"{E['ban']} Tum is channel ke admin nahi ho."}
+    if q("SELECT 1 FROM channels WHERE owner_id=? AND chat_id=?", (uid, chat["id"])):
+        return {"ok": False, "text": f"{E['warn']} Ye channel pehle se add hai."}
+    username = chat.get("username")
+    invite = f"https://t.me/{username}" if username else None
+    if not invite:   # private channel -> create a join link (does NOT revoke the old one)
+        r = await bot.api("createChatInviteLink", chat_id=chat["id"], name="Promo Bot")
+        invite = (r or {}).get("invite_link")
+    if not invite:
+        invite = await bot.api("exportChatInviteLink", chat_id=chat["id"])
+    q("INSERT INTO channels(owner_id,chat_id,title,username,invite,added_at) VALUES(?,?,?,?,?,?)",
+      (uid, chat["id"], chat.get("title"), username, invite, int(time.time())))
+    row = q("SELECT id FROM channels WHERE owner_id=? AND chat_id=?", (uid, chat["id"]))[0]
+    return {"ok": True, "title": chat.get("title"), "id": row["id"], "need_invite": not invite}
+
+
+async def finish_add(bot, uid, cid, res, msg=None):
+    if not res["ok"]:
+        STATE[uid] = {"mode": "add"}
+        text, mk = res["text"], add_kb(bot, uid)
+    elif res["need_invite"]:
+        STATE[uid] = {"mode": "invite", "id": res["id"]}
+        text = (f"{E['ok']} <b>Added:</b> {esc(res['title'])}\n\n"
+                f"{E['lock']} Ye <b>private</b> channel hai aur bot join-link nahi bana paya.\n"
+                f"{E['key']} Is channel ka <b>invite link</b> (<code>https://t.me/+xxxx</code>) yahan bhejo.")
+        mk = KB(back_row("Cancel", "cancel"))
+    else:
+        STATE[uid] = {"mode": "add"}
+        n = len(user_channels(uid))
+        text = (f"{E['ok']} <b>Added:</b> {esc(res['title'])}\n{E['diamond']} Total channels: <b>{n}</b>\n\n"
+                f"{E['plus']} Aur channel add karo ya <b>Done</b> dabao.")
+        mk = add_kb(bot, uid)
+    if msg:
+        await show(bot, msg, text, mk)
+    else:
+        await bot.send(cid, text, mk)
+
+
 async def add_channel(bot, uid, cid, m):
     ident = None
     fo = m.get("forward_origin")
+    t = (m.get("text") or "").strip()
     if fo and fo.get("type") == "channel":
         ident = fo["chat"]["id"]
     elif m.get("forward_from_chat"):
         ident = m["forward_from_chat"]["id"]
+    elif "t.me/+" in t or "joinchat" in t:
+        await bot.send(cid, f"{E['warn']} Private invite link se channel pehchana nahi jata.\n"
+                            f"{E['tri']} Bot ko channel me <b>Admin</b> banao - channel neeche button me aa jayega,\n"
+                            f"{E['tri']} ya us channel ka koi <b>post forward</b> karo.", add_kb(bot, uid))
+        return
     else:
-        t = (m.get("text") or "").strip()
         mt = re.search(r"(?:t\.me/|@)([A-Za-z0-9_]{4,})", t)
         if t.lstrip("-").isdigit():
             ident = int(t)
         elif mt:
             ident = "@" + mt.group(1)
-    kb_fail = KB([B(f"{E['ok']} Done", "add_done", style=G)], back_row("Cancel", "cancel"))
     if ident is None:
-        await bot.send(cid, f"{E['no']} Invalid. <code>@channel</code> bhejo ya channel ka koi post forward karo.", kb_fail)
+        await bot.send(cid, f"{E['no']} Invalid. <code>@channel</code> bhejo, post forward karo, ya bot ko admin banao.", add_kb(bot, uid))
         return
-    chat = await bot.api("getChat", chat_id=ident)
-    if not chat or chat["type"] not in ("channel", "supergroup"):
-        await bot.send(cid, f"{E['no']} Channel nahi mila. Bot ko pehle channel me <b>admin</b> banao.", kb_fail)
+    res = await register_channel(bot, uid, ident)
+    await finish_add(bot, uid, cid, res)
+
+
+async def save_invite(bot, uid, cid, m, st):
+    t = (m.get("text") or "").strip()
+    mt = re.search(r"https?://t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]+", t)
+    if not mt:
+        await bot.send(cid, f"{E['no']} Sahi invite link bhejo: <code>https://t.me/+xxxx</code>", KB(back_row("Cancel", "cancel")))
         return
-    me = await bot.api("getChatMember", chat_id=chat["id"], user_id=bot.id)
-    if not me or me["status"] != "administrator":
-        await bot.send(cid, f"{E['warn']} Bot is channel me admin nahi hai. Admin banao (invite-link permission ke sath) aur dobara bhejo.", kb_fail)
+    q("UPDATE channels SET invite=? WHERE id=? AND owner_id=?", (mt.group(0), st["id"], uid))
+    STATE[uid] = {"mode": "add"}
+    await bot.send(cid, f"{E['ok']} Invite link save ho gaya.\n{E['plus']} Aur channel add karo ya <b>Done</b> dabao.", add_kb(bot, uid))
+
+
+async def on_my_chat_member(bot, mc):
+    """Auto-detect when the bot is made admin in a channel (works for private channels too)."""
+    chat, new, frm = mc["chat"], mc["new_chat_member"], mc["from"]
+    if chat["type"] not in ("channel", "supergroup"):
         return
-    um = await bot.api("getChatMember", chat_id=chat["id"], user_id=uid)
-    if not um or um["status"] not in ("creator", "administrator"):
-        await bot.send(cid, f"{E['ban']} Tum is channel ke admin nahi ho.", kb_fail)
-        return
-    if q("SELECT 1 FROM channels WHERE owner_id=? AND chat_id=?", (uid, chat["id"])):
-        await bot.send(cid, f"{E['warn']} Ye channel pehle se add hai.", kb_fail)
-        return
-    username = chat.get("username")
-    invite = f"https://t.me/{username}" if username else None
-    if not invite:
-        invite = await bot.api("exportChatInviteLink", chat_id=chat["id"])
-    q("INSERT INTO channels(owner_id,chat_id,title,username,invite,added_at) VALUES(?,?,?,?,?,?)",
-      (uid, chat["id"], chat.get("title"), username, invite, int(time.time())))
-    n = len(user_channels(uid))
-    await bot.send(cid, f"{E['ok']} <b>Added:</b> {esc(chat.get('title'))}\n{E['diamond']} Total channels: <b>{n}</b>\n\n"
-                        f"{E['plus']} Aur channel add karo ya <b>Done</b> dabao.",
-                   KB([B(f"{E['ok']} Done - Get Link", "add_done", style=G)], back_row("Cancel", "cancel")))
+    if new["status"] == "administrator":
+        q("INSERT OR REPLACE INTO bot_chats VALUES(?,?,?,?,?,?)",
+          (bot.id, chat["id"], chat.get("title"), chat.get("username"), frm["id"], int(time.time())))
+        if not q("SELECT 1 FROM channels WHERE owner_id=? AND chat_id=?", (frm["id"], chat["id"])):
+            await bot.send(frm["id"], f"{E['ok']} Bot <b>{esc(chat.get('title'))}</b> me admin ban gaya.\n"
+                                      f"{E['plus']} Is channel ko apni list me add karna hai?",
+                           KB([B(f"{E['plus']} Add this channel", f"ac:{chat['id']}", style=G)]))
+    else:
+        q("DELETE FROM bot_chats WHERE bot_id=? AND chat_id=?", (bot.id, chat["id"]))
 
 
 async def do_post(bot, uid, cid, m, st):
@@ -559,7 +667,8 @@ async def admin_panel(bot, cid, msg=None):
          f"{E['diamond']} Channels: <b>{q('SELECT COUNT(*) c FROM channels')[0]['c']}</b>\n"
          f"{E['premium']} Clones: <b>{q('SELECT COUNT(*) c FROM clones')[0]['c']}</b>\n"
          f"{E['star']} Promo joins: <b>{q('SELECT COUNT(*) c FROM promo_joins')[0]['c']}</b>\n{E['border_bot']}")
-    kb = KB([B(f"{E['broadcast']} Broadcast", "bc", style=G), B(f"{E['refresh']} Refresh", "adm", style=P)], back_row())
+    kb = KB([B(f"{E['broadcast']} Broadcast", "bc", style=G), B(f"{E['refresh']} Refresh", "adm", style=P)],
+            [B(f"{E['download']} Backup Now", "bk", style=G)], back_row())
     if msg:
         await show(bot, msg, t, kb)
     else:
@@ -591,9 +700,11 @@ async def on_callback(bot, cb):
     # ---- verify ----
     if data == "verify":
         owner = PENDING.get(uid, get_user(uid)["referred_by"])
-        miss = await process_gate(bot, uid, owner, u, final=True)
+        items, miss = await process_gate(bot, uid, owner, u, final=True)
         if miss:
-            await ans(f"{E['warn']} Abhi bhi kuch channels join nahi kiye! Sab join karo.", True)
+            await ans(f"{E['warn']} Abhi {len(miss)} channel join karna baaki hai! Sab join karo.", True)
+            await bot.api("editMessageReplyMarkup", chat_id=cid, message_id=msg["message_id"],
+                          reply_markup=gate_markup(items))
             return
         await ans(f"{E['ok']} Verified!")
         await show(bot, msg, profile_text(u) + f"\n\n{E['unlock']} {E['ok']} <b>Verified!</b>", menu_markup(uid))
@@ -620,10 +731,15 @@ async def on_callback(bot, cb):
         STATE[uid] = {"mode": "add"}
         await show(bot, msg,
                    f"<blockquote><b>{E['plus']} ADD CHANNEL</b></blockquote>\n"
-                   f"{E['folder']} 1. Bot ko apne channel me <b>Admin</b> banao\n"
-                   f"{E['folder']} 2. Channel ka <code>@username</code> bhejo ya koi post <b>forward</b> karo\n"
+                   f"{E['folder']} 1. Bot ko apne channel me <b>Admin</b> banao (public ya private)\n"
+                   f"{E['folder']} 2. Channel neeche <b>green button</b> me aa jayega - bas dabao\n"
+                   f"{E['folder']} Ya <code>@username</code> bhejo / channel ka koi post <b>forward</b> karo\n"
                    f"{E['folder']} Jitne chahe channels add karo, phir <b>Done</b> dabao.",
-                   KB([B(f"{E['ok']} Done - Get Link", "add_done", style=G)], back_row("Cancel", "cancel")))
+                   add_kb(bot, uid))
+
+    elif data.startswith("ac:"):
+        res = await register_channel(bot, uid, int(data[3:]))
+        await finish_add(bot, uid, cid, res, msg)
 
     elif data == "add_done":
         STATE.pop(uid, None)
@@ -730,6 +846,10 @@ async def on_callback(bot, cb):
     elif data == "adm" and uid in ADMIN_IDS:
         await admin_panel(bot, cid, msg)
 
+    elif data == "bk" and uid in ADMIN_IDS:
+        ok = await backup_db(MAIN, force=True)
+        await bot.send(cid, f"{E['ok']} Backup tumhari chat me bhej diya." if ok else f"{E['warn']} Backup nahi ho paya (logs dekho).")
+
     elif data == "bc" and uid in ADMIN_IDS:
         STATE[uid] = {"mode": "broadcast"}
         await show(bot, msg, f"{E['broadcast']} Broadcast message bhejo (kuch bhi).", KB(back_row("Cancel", "cancel")))
@@ -748,6 +868,8 @@ async def safe(bot, u):
             await on_message(bot, u["message"])
         elif "callback_query" in u:
             await on_callback(bot, u["callback_query"])
+        elif "my_chat_member" in u:
+            await on_my_chat_member(bot, u["my_chat_member"])
     except Exception:
         log.exception("handler error")
 
@@ -766,13 +888,100 @@ async def run_bot(bot):
     offset = 0
     while True:
         ups = await bot.api("getUpdates", offset=offset, timeout=30,
-                            allowed_updates=["message", "callback_query"])
+                            allowed_updates=["message", "callback_query", "my_chat_member"])
         if ups is None:
             await asyncio.sleep(3)
             continue
         for u in ups:
             offset = u["update_id"] + 1
             spawn(safe(bot, u))
+
+
+# ---------- DB backup/restore via Telegram (Render free disk is temporary) ----------
+BK = {"changes": -1, "msg": None, "ok": True}
+BK_NAME = "promo_backup.db"
+
+
+def _users_count():
+    return q("SELECT COUNT(*) c FROM users")[0]["c"]
+
+
+async def backup_db(bot, force=False):
+    """Send DB file to the first admin's private chat and pin it."""
+    if not ADMIN_IDS or not BK["ok"] or _users_count() == 0:
+        return False
+    if not force and _db.total_changes == BK["changes"]:
+        return False
+    tmp = os.path.join(tempfile.gettempdir(), BK_NAME)
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    dst = sqlite3.connect(tmp)
+    _db.backup(dst)
+    dst.close()
+    with open(tmp, "rb") as f:
+        data = f.read()
+    aid = ADMIN_IDS[0]
+    r = await bot.upload("sendDocument", {"chat_id": aid, "disable_notification": "true",
+                                          "caption": f"{BRAND} database backup (auto) - delete mat karna"},
+                         "document", BK_NAME, data)
+    if not r:
+        return False
+    await bot.api("pinChatMessage", chat_id=aid, message_id=r["message_id"], disable_notification=True)
+    if BK["msg"]:
+        await bot.api("deleteMessage", chat_id=aid, message_id=BK["msg"])
+    BK["msg"] = r["message_id"]
+    BK["changes"] = _db.total_changes
+    log.info("DB backup sent (%s bytes)", len(data))
+    return True
+
+
+async def restore_db(bot):
+    """If DB is empty (fresh Render disk) restore it from the pinned backup in admin chat."""
+    global _db
+    if _users_count() > 0 or not ADMIN_IDS:
+        BK["changes"] = _db.total_changes
+        return
+    for attempt in range(3):
+        try:
+            chat = await bot.api("getChat", chat_id=ADMIN_IDS[0])
+            pm = (chat or {}).get("pinned_message")
+            doc = (pm or {}).get("document")
+            if not doc or doc.get("file_name") != BK_NAME:
+                if chat is not None:
+                    log.info("Koi backup nahi mila - fresh start")
+                    BK["changes"] = _db.total_changes
+                    return
+                raise RuntimeError("getChat failed")
+            f = await bot.api("getFile", file_id=doc["file_id"])
+            async with bot.s.get(f"https://api.telegram.org/file/bot{bot.token}/{f['file_path']}") as r:
+                data = await r.read()
+            tmp = os.path.join(tempfile.gettempdir(), "restore.db")
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            src = sqlite3.connect(tmp)
+            src.backup(_db)
+            src.close()
+            _db.executescript(SCHEMA)
+            _db.commit()
+            BK["msg"] = pm["message_id"]
+            BK["changes"] = _db.total_changes
+            log.info("DB restored from Telegram backup: %s users", _users_count())
+            return
+        except Exception as e:
+            log.warning("restore try %s failed: %s", attempt + 1, e)
+            await asyncio.sleep(3)
+    BK["ok"] = False   # never overwrite a good backup with an empty DB
+    log.error("Restore fail - backups pause kiye gaye taaki purana backup safe rahe")
+
+
+async def backup_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await backup_db(MAIN)
+        except Exception:
+            log.exception("backup error")
+        await asyncio.sleep(240)
 
 
 async def web_server():
@@ -812,11 +1021,22 @@ async def main():
     await web_server()
     async with aiohttp.ClientSession() as s:
         MAIN = Bot(BOT_TOKEN, s)
+        await restore_db(MAIN)
         spawn(run_bot(MAIN))
         spawn(keep_alive(s))
+        spawn(backup_loop())
         for r in q("SELECT token FROM clones"):
             spawn(run_bot(Bot(r["token"], s)))
-        await asyncio.Event().wait()
+        stop = asyncio.Event()
+        try:
+            asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
+        except Exception:
+            pass
+        await stop.wait()
+        try:
+            await backup_db(MAIN)   # last backup before Render stops the instance
+        except Exception:
+            log.exception("final backup error")
 
 
 if __name__ == "__main__":
